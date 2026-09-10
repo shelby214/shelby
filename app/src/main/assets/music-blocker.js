@@ -32,10 +32,13 @@
   const PROMO_PATTERN = /(youtube\s+music\s+premium|music\s+premium|try\s+premium|upgrade\s+to\s+premium|ad[- ]free)/i;
   const DISMISS_PATTERN = /(no thanks|not now|dismiss|close|maybe later|got it)/i;
 
-  const style = document.createElement('style');
-  style.id = 'shelby-music-ad-style';
-  style.textContent = `${AD_SELECTORS.join(',')}{display:none!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important}`;
-  document.documentElement.appendChild(style);
+  const addStyles = () => {
+    if (!document.documentElement || document.getElementById('shelby-music-ad-style')) return;
+    const style = document.createElement('style');
+    style.id = 'shelby-music-ad-style';
+    style.textContent = `${AD_SELECTORS.join(',')}{display:none!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important}`;
+    document.documentElement.appendChild(style);
+  };
 
   const visible = element => {
     if (!(element instanceof HTMLElement)) return false;
@@ -51,16 +54,18 @@
     previousMuted: false,
     previousRate: 1,
 
-    isAd() {
-      const player = document.getElementById('movie_player');
-      const app = document.querySelector('ytmusic-app');
+    player() {
+      return document.getElementById('movie_player') || document.querySelector('ytmusic-player .html5-video-player')
+        || document.querySelector('ytmusic-player');
+    },
+
+    isAd(player) {
+      // Queue and app metadata can describe the next ad while a normal song is playing.
+      // Only the live media player's ad state authorizes seeking, muting, or speeding up.
       return Boolean(
         player?.classList.contains('ad-showing') ||
         player?.classList.contains('ad-interrupting') ||
-        app?.hasAttribute('ad-showing') ||
-        document.querySelector(
-          'ytmusic-player-queue-item[is-advertisement],ytmusic-player-queue-item[is-ad]'
-        )
+        (player?.tagName === 'YTMUSIC-PLAYER' && player.hasAttribute('ad-showing'))
       );
     },
 
@@ -96,15 +101,15 @@
         backdrop.style.setProperty('display', 'none', 'important');
         backdrop.style.setProperty('pointer-events', 'none', 'important');
       });
-      document.documentElement.style.removeProperty('overflow');
+      document.documentElement?.style.removeProperty('overflow');
       document.body?.style.removeProperty('overflow');
       document.body?.style.removeProperty('pointer-events');
     },
 
-    clickAdSkip() {
+    clickAdSkip(player) {
       for (const selector of SKIP_SELECTORS) {
-        document.querySelectorAll(selector).forEach(button => {
-          if (button instanceof HTMLElement && visible(button)) button.click();
+        player.querySelectorAll(selector).forEach(button => {
+          if (button instanceof HTMLElement) button.click();
         });
       }
     },
@@ -116,34 +121,42 @@
         this.previousMuted = media.muted;
         this.previousRate = media.playbackRate || 1;
       }
-      media.muted = true;
-      media.playbackRate = 16;
+      try {
+        media.muted = true;
+        media.playbackRate = 16;
+      } catch (_) { this.restoreMedia(); return; }
       const duration = Number(media.duration);
       if (Number.isFinite(duration) && duration > 0) {
         try { media.currentTime = Math.max(0, duration - 0.03); } catch (_) {}
       }
-      if (media.paused) media.play().catch(() => {});
     },
 
     restoreMedia() {
       if (!this.forcedMedia) return;
-      this.forcedMedia.muted = this.previousMuted;
-      this.forcedMedia.playbackRate = this.previousRate || 1;
+      const media = this.forcedMedia;
       this.forcedMedia = null;
+      try {
+        if (media.muted === true) media.muted = this.previousMuted;
+        if (media.playbackRate === 16) media.playbackRate = this.previousRate || 1;
+      } catch (_) {}
     },
 
     run() {
       window.clearTimeout(this.timer);
+      window.clearTimeout(this.pendingTimer);
+      addStyles();
       this.dismissPremiumUpsells();
       this.clearStaleClickShields();
-      this.clickAdSkip();
 
-      const ad = this.isAd();
-      const media = document.querySelector('video.html5-main-video,video,audio');
-      if (ad && media) this.forcePastAd(media);
+      const player = this.player();
+      if (this.isAd(player)) this.clickAdSkip(player);
+      // The Skip button can change the current player immediately.
+      const ad = this.isAd(player);
+      const media = player?.querySelector('video,audio');
+      if (ad && media && !media.paused && !media.ended) this.forcePastAd(media);
       else this.restoreMedia();
 
-      this.timer = window.setTimeout(() => this.run(), ad ? 100 : 750);
+      this.timer = window.setTimeout(() => this.run(), ad ? 100 : 1500);
     },
 
     schedule(delay = 120) {
@@ -153,12 +166,32 @@
   };
 
   window.__shelbyMusicBlocker = blocker;
-  new MutationObserver(() => blocker.schedule()).observe(document.documentElement, {
+  new MutationObserver(() => {
+    // Clear mute/speed in this microtask as soon as the ad class disappears.
+    if (!blocker.isAd(blocker.player())) blocker.restoreMedia();
+    blocker.schedule();
+  }).observe(document, {
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ['class', 'ad-showing', 'is-ad', 'is-advertisement', 'opened']
+    attributeFilter: ['class', 'ad-showing', 'opened']
   });
-  document.addEventListener('yt-navigate-finish', () => blocker.schedule(0));
+  document.addEventListener('yt-navigate-start', () => blocker.restoreMedia());
+  document.addEventListener('yt-navigate-finish', () => {
+    blocker.restoreMedia();
+    blocker.schedule(0);
+  });
+  ['emptied', 'loadstart', 'loadedmetadata'].forEach(type => {
+    document.addEventListener(type, event => {
+      if (blocker.forcedMedia === event.target) blocker.restoreMedia();
+    }, true);
+  });
+  document.addEventListener('playing', () => blocker.schedule(0), true);
+  window.addEventListener('pagehide', () => {
+    window.clearTimeout(blocker.timer);
+    window.clearTimeout(blocker.pendingTimer);
+    blocker.restoreMedia();
+  });
+  window.addEventListener('pageshow', () => blocker.schedule(0));
   blocker.run();
 })();

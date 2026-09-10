@@ -5,16 +5,30 @@ plugins {
 android {
     namespace "com.samarth.ytcleanplayer"
     compileSdk 36
+    buildToolsVersion "36.0.0"
+    useLibrary "android.test.runner"
+    useLibrary "android.test.base"
+    buildFeatures { buildConfig true }
+    testBuildType project.findProperty("testBuildType") ?: "debug"
 
     defaultConfig {
         applicationId "com.samarth.ytcleanplayer"
         minSdk 36
         targetSdk 36
-        versionCode 31
-        versionName "1.9.4"
+        versionCode 32
+        versionName "2.0.0"
+        testInstrumentationRunner "android.test.InstrumentationTestRunner"
+        manifestPlaceholders = [appLabel: "Shelby"]
     }
 
     buildTypes {
+        preview {
+            initWith debug
+            applicationIdSuffix ".preview"
+            versionNameSuffix "-preview"
+            manifestPlaceholders = [appLabel: "Shelby Preview"]
+            matchingFallbacks = ["debug"]
+        }
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
@@ -25,4 +39,8 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+}
+
+dependencies {
+    implementation "androidx.webkit:webkit:1.14.0"
 }

@@ -13,6 +13,12 @@
 (() => {
   'use strict';
 
+  if (!/(^|\.)youtube\.com$/.test(location.hostname) || location.hostname === 'music.youtube.com') return;
+  if (window.__shelbyVideoBlocker) {
+    window.__shelbyVideoBlocker.run();
+    return;
+  }
+
   const PATCH_FLAG = '__ytZeroAdsV21Patched';
   const DETECTION_FLAG_PATTERN = /(ad.?block|adblock|ab[_-]?(det|rsp|ref))/i;
   const AD_RESPONSE_KEYS = new Set([
@@ -207,33 +213,52 @@
     (document.head || document.documentElement).appendChild(style);
   };
 
-  const playerIsShowingAd = () => {
-    const player = document.getElementById('movie_player');
-    const watch = document.querySelector('ytd-watch-flexy');
-    return Boolean(
-      player?.classList.contains('ad-showing') ||
-      player?.classList.contains('ad-interrupting') ||
-      watch?.hasAttribute('ad-showing')
-    );
-  };
+  const activePlayer = () => document.getElementById('movie_player') ||
+    document.querySelector('.html5-video-player');
 
-  const clickSkipButtons = () => {
+  const playerIsShowingAd = player => Boolean(player && (
+    player.classList.contains('ad-showing') || player.classList.contains('ad-interrupting')
+  ));
+
+  const clickSkipButtons = player => {
     for (const selector of SKIP_SELECTORS) {
-      document.querySelectorAll(selector).forEach((button) => {
+      player.querySelectorAll(selector).forEach((button) => {
         if (button instanceof HTMLElement) button.click();
       });
     }
   };
 
+  let forced = null;
+  const restorePlayback = () => {
+    if (!forced) return;
+    const previous = forced;
+    forced = null;
+    // Restore exactly what this blocker changed, including the user's original mute/speed.
+    // A player replacement must also restore the detached ad element before it is reused.
+    try {
+      if (previous.media.muted === true) previous.media.muted = previous.muted;
+      if (previous.media.playbackRate === 16) previous.media.playbackRate = previous.rate;
+    } catch (_) {}
+  };
+
   const skipCurrentAd = () => {
-    clickSkipButtons();
-    if (!playerIsShowingAd()) return false;
+    const player = activePlayer();
+    if (!playerIsShowingAd(player)) { restorePlayback(); return false; }
+    clickSkipButtons(player);
+    // Clicking Skip can synchronously switch the existing element back to content.
+    if (!playerIsShowingAd(player)) { restorePlayback(); return false; }
 
-    const video = document.querySelector('video.html5-main-video') || document.querySelector('video');
-    if (!video) return true;
+    const video = player.querySelector('video,audio');
+    if (!video || video.paused || video.ended) { restorePlayback(); return true; }
 
-    video.muted = true;
-    video.playbackRate = 16;
+    if (!forced || forced.media !== video) {
+      restorePlayback();
+      forced = { media: video, muted: video.muted, rate: video.playbackRate || 1 };
+    }
+    try {
+      video.muted = true;
+      video.playbackRate = 16;
+    } catch (_) { restorePlayback(); return true; }
 
     const duration = Number(video.duration);
     if (Number.isFinite(duration) && duration > 0) {
@@ -244,14 +269,7 @@
       }
     }
 
-    if (video.paused) video.play().catch(() => {});
     return true;
-  };
-
-  const restorePlayback = () => {
-    if (playerIsShowingAd()) return;
-    const video = document.querySelector('video.html5-main-video') || document.querySelector('video');
-    if (video && video.playbackRate === 16) video.playbackRate = 1;
   };
 
   let fastTimer = 0;
@@ -260,17 +278,17 @@
     disableAdBlockDetectionFlags();
     dismissAdBlockEnforcement();
     const adFound = skipCurrentAd();
-    restorePlayback();
-    fastTimer = window.setTimeout(runFastPass, adFound ? 25 : 350);
+    fastTimer = window.setTimeout(runFastPass, adFound ? 100 : 1000);
   };
 
+  window.__shelbyVideoBlocker = { run: runFastPass, restore: restorePlayback };
   addStyles();
   new MutationObserver(() => {
     addStyles();
     disableAdBlockDetectionFlags();
     dismissAdBlockEnforcement();
     skipCurrentAd();
-  }).observe(document.documentElement, {
+  }).observe(document, {
     childList: true,
     subtree: true,
     attributes: true,
@@ -278,9 +296,22 @@
   });
 
   document.addEventListener('yt-navigate-finish', () => {
+    restorePlayback();
     addStyles();
     skipCurrentAd();
   });
+  document.addEventListener('yt-navigate-start', restorePlayback);
+  ['emptied', 'loadstart', 'loadedmetadata'].forEach(type => {
+    document.addEventListener(type, event => {
+      if (forced?.media === event.target) restorePlayback();
+    }, true);
+  });
+  document.addEventListener('playing', runFastPass, true);
+  window.addEventListener('pagehide', () => {
+    window.clearTimeout(fastTimer);
+    restorePlayback();
+  });
+  window.addEventListener('pageshow', runFastPass);
 
   runFastPass();
 })();
