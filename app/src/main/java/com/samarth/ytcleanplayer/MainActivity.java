@@ -15,6 +15,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
 import android.graphics.Insets;
 import android.graphics.Outline;
@@ -63,7 +64,9 @@ public class MainActivity extends Activity implements PlaybackSession.Listener {
     private float miniTouchX, miniTouchY, miniStartX, miniStartY;
     private boolean miniDragging;
     private ProgressBar progress;
+    private Button fullscreenSettings;
     private View fullScreen;
+    private int orientationBeforeFullscreen = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
     private WebChromeClient.CustomViewCallback fullScreenCallback;
     private int left, top, right, bottom;
     private boolean mini, pipPrepared, notificationAsked;
@@ -81,6 +84,7 @@ public class MainActivity extends Activity implements PlaybackSession.Listener {
         root = new FrameLayout(this);
         root.setBackgroundColor(0xff0f0f0f);
         setContentView(root);
+        PlaybackSession.prepareTask(this, getTaskId());
         session = PlaybackSession.obtain(this);
         buildSectionPill();
         buildMiniControls();
@@ -148,15 +152,160 @@ public class MainActivity extends Activity implements PlaybackSession.Listener {
         }
         session.switchSection(music);
     }
+    private AlertDialog settingsSheet(String title, String[] labels, android.content.DialogInterface.OnClickListener click) {
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(title).setItems(labels, click)
+                .setNegativeButton("Close", null).create();
+        dialog.show();
+        boolean landscape = getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
+        dialog.getWindow().setBackgroundDrawable(shape(0xff202020, 20));
+        dialog.getWindow().setDimAmount(.35f);
+        dialog.getWindow().setGravity(Gravity.BOTTOM | (landscape ? Gravity.RIGHT : Gravity.CENTER_HORIZONTAL));
+        dialog.getWindow().setLayout(Math.min(getResources().getDisplayMetrics().widthPixels - dp(24), dp(420)), -2);
+        return dialog;
+    }
     private void showSettings() {
-        new AlertDialog.Builder(this).setTitle("Playback settings")
-                .setMultiChoiceItems(new String[]{"Skip sponsored segments · SponsorBlock"},
-                        new boolean[]{session.sponsorEnabled()}, (dialog, which, enabled) -> session.setSponsorEnabled(enabled))
-                .setPositiveButton("Done",null)
-                .setNeutralButton("About SponsorBlock", (dialog, which) -> new AlertDialog.Builder(this)
-                        .setTitle("SponsorBlock")
-                        .setMessage("Automatically skips sponsor segments identified by the SponsorBlock community. Undo appears after each skip.\n\nWhen enabled, video IDs are sent to sponsor.ajay.app to look up segments. Videos without submitted segments play normally.")
-                        .setPositiveButton("OK",null).show()).show();
+        webView.evaluateJavascript("window.__shelbyPlayback?.playbackOptions() || {}", raw -> {
+            if (isFinishing() || isDestroyed()) return;
+            JSONObject options;
+            try { options = new JSONObject(raw); } catch (Exception ignored) { options = new JSONObject(); }
+            final JSONObject current = options;
+            String speed = options.optDouble("speed", 1) + "×";
+            settingsSheet("Playback settings", new String[]{
+                    "Playback speed · " + speed,
+                    "Quality · " + qualityLabel(options.optString("quality", "auto")),
+                    "Audio quality & details",
+                    "SponsorBlock · " + (session.sponsorEnabled() ? "On" : "Off")}, (dialog, which) -> {
+                if (which == 0) {
+                    String[] labels = {"0.25×", "0.5×", "0.75×", "Normal · 1×", "1.25×", "1.5×", "1.75×", "2×"};
+                    double[] speeds = {.25,.5,.75,1,1.25,1.5,1.75,2};
+                    settingsSheet("Playback speed", labels, (d, index) ->
+                            applyPlayerSetting("setSpeed(" + speeds[index] + ")"));
+                } else if (which == 1) {
+                    org.json.JSONArray qualities = current.optJSONArray("qualities");
+                    if (qualities == null || qualities.length() == 0) {
+                        Toast.makeText(this,"Quality options appear once the video loads",Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    String[] labels = new String[qualities.length()];
+                    for (int i=0;i<labels.length;i++) labels[i]=qualityLabel(qualities.optString(i));
+                    settingsSheet("Video quality", labels, (d,index) ->
+                            applyPlayerSetting("setQuality(" + JSONObject.quote(qualities.optString(index)) + ")"));
+                } else if (which == 2) {
+                    showAudioDetails();
+                } else {
+                    settingsSheet("SponsorBlock", new String[]{"On · skip sponsored segments", "Off", "About SponsorBlock"}, (d,index) -> {
+                        if (index < 2) session.setSponsorEnabled(index == 0);
+                        else new AlertDialog.Builder(this).setTitle("SponsorBlock")
+                                .setMessage("Skips community-submitted sponsor segments. Undo appears after each skip. When enabled, video IDs are sent to sponsor.ajay.app. Videos without submitted segments play normally.")
+                                .setPositiveButton("OK",null).show();
+                    });
+                }
+            });
+        });
+    }
+    private void showAudioDetails() {
+        android.widget.ScrollView scroll = new android.widget.ScrollView(this);
+        TextView details = new TextView(this);
+        details.setTextColor(0xffeeeeee);
+        details.setTextSize(15);
+        details.setAutoLinkMask(android.text.util.Linkify.WEB_URLS);
+        details.setLinkTextColor(0xffb4a1ff);
+        details.setLineSpacing(dp(4), 1);
+        details.setPadding(dp(24), dp(12), dp(24), dp(16));
+        details.setText("Reading the current audio stream…");
+        scroll.addView(details);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("Audio quality & details")
+                .setView(scroll).setPositiveButton("Done", null)
+                .setNeutralButton("Phone sound settings", (d, which) -> {
+                    try { startActivity(new Intent(android.provider.Settings.ACTION_SOUND_SETTINGS)); }
+                    catch (Exception ignored) { Toast.makeText(this,"Phone sound settings are unavailable",Toast.LENGTH_SHORT).show(); }
+                }).create();
+        dialog.show();
+        dialog.getWindow().setBackgroundDrawable(shape(0xff202020, 20));
+        dialog.getWindow().setLayout(Math.min(getResources().getDisplayMetrics().widthPixels - dp(24), dp(440)),
+                Math.min(getResources().getDisplayMetrics().heightPixels - dp(60), dp(650)));
+        android.os.Handler refresh = new android.os.Handler(android.os.Looper.getMainLooper());
+        Runnable update = new Runnable() {
+            @Override public void run() {
+                if (!dialog.isShowing() || isFinishing() || isDestroyed()) return;
+                webView.evaluateJavascript("window.__shelbyPlayback?.audioDetails() || {}", raw -> {
+                    if (!dialog.isShowing() || isFinishing() || isDestroyed()) return;
+                    try { details.setText(formatAudioDetails(new JSONObject(raw))); }
+                    catch (Exception ignored) { details.setText("Audio details are unavailable. Start a track and try again."); }
+                    refresh.postDelayed(this, 2000);
+                });
+            }
+        };
+        dialog.setOnDismissListener(d -> refresh.removeCallbacksAndMessages(null));
+        refresh.post(update);
+    }
+    private String formatAudioDetails(JSONObject data) {
+        StringBuilder text = new StringBuilder();
+        String title = data.optString("title");
+        if (!title.isEmpty()) text.append(title).append("\n").append(data.optString("artist")).append("\n\n");
+        text.append("NOW PLAYING\n").append(data.optString("status", "Unavailable")).append("\n");
+        JSONObject stream = data.optJSONObject("active");
+        String codec = stream == null ? data.optString("codecDisplay", "Unavailable") : stream.optString("codec", "Unavailable");
+        text.append("Codec: ").append("mp4a.40.2".equals(codec) ? "AAC-LC" : codec).append("\n");
+        if (stream != null) {
+            text.append("Container: ").append(stream.optString("container")).append("\n");
+            text.append("Average bitrate: ").append(audioNumber(stream,"averageBitrate",1000," kbps")).append("\n");
+            text.append("Advertised bitrate: ").append(audioNumber(stream,"bitrate",1000," kbps")).append("\n");
+            text.append("Sample rate: ").append(audioNumber(stream,"sampleRate",1000," kHz")).append("\n");
+            int channels = stream.optInt("channels",0);
+            text.append("Channels: ").append(channels==2?"Stereo · 2":channels==1?"Mono · 1":channels>0?String.valueOf(channels):"Unavailable").append("\n");
+            text.append("Stream quality: ").append(stream.optString("quality","Unavailable")).append("\n");
+            text.append("Format ID: ").append(stream.optInt("formatId")).append("\n");
+        } else text.append("Bitrate / sample rate: unavailable\n");
+        text.append(data.optString("source")).append("\n\nPLAYBACK\n");
+        text.append("Speed: ").append(data.optDouble("speed",1)).append("×\n");
+        text.append("Player volume: ").append(data.optBoolean("muted")?"Muted":audioNumber(data,"volumePercent",1,"%" )).append("\n");
+        android.media.AudioManager audio = (android.media.AudioManager)getSystemService(AUDIO_SERVICE);
+        text.append("Phone media volume: ").append(audio.getStreamVolume(android.media.AudioManager.STREAM_MUSIC))
+                .append(" / ").append(audio.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)).append("\n");
+        text.append("Buffered ahead: ").append(audioNumber(data,"bufferedSeconds",1," s")).append("\n");
+        if (!data.isNull("networkEstimate")) text.append("Network estimate: ").append(data.optString("networkEstimate")).append(" (not audio bitrate)\n");
+        if (!data.isNull("normalization")) text.append("Provider volume / normalization: ").append(data.optString("normalization")).append("\n");
+        if (!data.isNull("loudnessLkfs")) text.append("Track loudness: ").append(audioNumber(data,"loudnessLkfs",1," LKFS")).append("\n");
+        if (!data.isNull("targetLkfs")) text.append("Provider loudness target: ").append(audioNumber(data,"targetLkfs",1," LKFS")).append("\n");
+        org.json.JSONArray formats = data.optJSONArray("formats");
+        text.append("\nAVAILABLE AUDIO STREAMS\n");
+        if (formats == null || formats.length()==0) text.append("Not exposed by this player.\n");
+        else for (int i=0;i<formats.length();i++) {
+            JSONObject format = formats.optJSONObject(i);
+            if (format == null) continue;
+            String name = format.optString("codec", "Unknown");
+            text.append("• ").append("mp4a.40.2".equals(name)?"AAC-LC":name).append(" · ")
+                    .append(audioNumber(format,"averageBitrate",1000," kbps average")).append(" · ")
+                    .append(audioNumber(format,"sampleRate",1000," kHz")).append("\n");
+        }
+        text.append("\nGETTING THE BEST SOUND\n");
+        text.append(data.optBoolean("highQualityAvailable")?"A High-quality audio stream is exposed for this track. Check the active stream above to see what is actually playing.\n":
+                "No High-quality audio stream is exposed for this track right now. This does not establish your subscription status.\n");
+        text.append("YouTube Music Premium offers up to 256 kbps AAC/Opus. Choose High in YouTube Music’s audio-quality settings where available; access depends on the account and track.\n\n")
+                .append("Video resolution does not guarantee a higher audio bitrate. Variable-bitrate streams change with the music; the average above comes from the current track’s metadata.\n\n")
+                .append("Shelby plays the source audio without extra sound processing. Equalizers change the tonal balance, but cannot recover details lost during compression. Phone sound settings may offer device-specific effects.\n\n")
+                .append("Details refresh every 2 seconds while this panel is open. Unavailable means the player did not expose verified data.\n\nYouTube Music audio-quality guide:\nhttps://support.google.com/youtubemusic/answer/9076559");
+        return text.toString();
+    }
+    private static String audioNumber(JSONObject object, String key, double divisor, String suffix) {
+        if (object.isNull(key) || !object.has(key)) return "Unavailable";
+        double value = object.optDouble(key, Double.NaN) / divisor;
+        return Double.isFinite(value) ? String.format(java.util.Locale.US, "%.1f", value) + suffix : "Unavailable";
+    }
+    private void applyPlayerSetting(String call) {
+        webView.evaluateJavascript("window.__shelbyPlayback?." + call, result -> {
+            if (!"true".equals(result)) Toast.makeText(this,"This setting is unavailable for the current video",Toast.LENGTH_SHORT).show();
+        });
+    }
+    private static String qualityLabel(String quality) {
+        return switch (quality) {
+            case "tiny" -> "144p"; case "small" -> "240p"; case "medium" -> "360p";
+            case "large" -> "480p"; case "hd720" -> "720p"; case "hd1080" -> "1080p";
+            case "hd1440" -> "1440p"; case "hd2160" -> "2160p · 4K";
+            case "highres" -> "Highest available"; case "auto", "default" -> "Auto";
+            default -> quality;
+        };
     }
     private void layoutShell() {
         if (webView == null) return;
@@ -456,15 +605,26 @@ public class MainActivity extends Activity implements PlaybackSession.Listener {
     }
     @Override public void onFullScreen(View view,WebChromeClient.CustomViewCallback callback){
         if(fullScreen!=null){callback.onCustomViewHidden();return;}
+        orientationBeforeFullscreen=getRequestedOrientation();
         fullScreen=view;fullScreenCallback=callback;webView.setVisibility(View.INVISIBLE);
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         root.addView(view,new FrameLayout.LayoutParams(-1,-1));
+        fullscreenSettings=button("⚙", "Playback settings");
+        fullscreenSettings.setTextSize(22);
+        fullscreenSettings.setOnClickListener(v -> showSettings());
+        FrameLayout.LayoutParams settingsPosition=new FrameLayout.LayoutParams(dp(48),dp(48),Gravity.TOP|Gravity.RIGHT);
+        settingsPosition.setMargins(dp(20),dp(12),dp(36),0);
+        root.addView(fullscreenSettings,settingsPosition);
+        fullscreenSettings.setElevation(dp(24));
         getWindow().getInsetsController().setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
         getWindow().getInsetsController().hide(WindowInsets.Type.systemBars());layoutShell();
     }
     @Override public void onExitFullScreen(){hideFullScreen();}
     private void hideFullScreen(){
         if(fullScreen==null)return;
+        if(fullscreenSettings!=null){root.removeView(fullscreenSettings);fullscreenSettings=null;}
         root.removeView(fullScreen);fullScreen=null;webView.setVisibility(View.VISIBLE);
+        setRequestedOrientation(orientationBeforeFullscreen);
         WebChromeClient.CustomViewCallback callback=fullScreenCallback;fullScreenCallback=null;if(callback!=null)callback.onCustomViewHidden();
         getWindow().getInsetsController().show(WindowInsets.Type.systemBars());layoutShell();
     }
@@ -496,9 +656,9 @@ public class MainActivity extends Activity implements PlaybackSession.Listener {
         if(session!=null){
             session.evaluate("window.__shelbySurface?.exit();");
             session.detach(this);
-            if(isFinishing()){
+            if(isFinishing() && session.isAvailable()){
                 session.command(MediaPlaybackService.COMMAND_STOP,0);
-                session.release();
+                PlaybackSession.discard(this);
             }
         }
         super.onDestroy();

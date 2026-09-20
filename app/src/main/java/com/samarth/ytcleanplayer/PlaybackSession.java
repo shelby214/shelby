@@ -80,6 +80,19 @@ final class PlaybackSession implements MediaPlaybackService.PlaybackController {
         }
     };
 
+    static void prepareTask(Context context, int taskId) {
+        SharedPreferences saved = context.getSharedPreferences("playback_session", Context.MODE_PRIVATE);
+        if (saved.getInt("task_id", -1) != taskId) {
+            discard(context);
+            saved.edit().putInt("task_id", taskId).commit();
+        }
+    }
+
+    static void discard(Context context) {
+        if (instance != null) instance.release();
+        context.getSharedPreferences("playback_session", Context.MODE_PRIVATE).edit().clear().commit();
+    }
+
     static PlaybackSession obtain(Context context) {
         if (instance == null || instance.destroyed) instance = new PlaybackSession(context);
         return instance;
@@ -355,6 +368,7 @@ final class PlaybackSession implements MediaPlaybackService.PlaybackController {
     }
 
     void command(String command, double value) {
+        if (destroyed) return;
         if ("play".equals(command) && retryNativeRestore()) return;
         if ("play".equals(command) || "pause".equals(command) || "stop".equals(command)) clearNativeRestore();
         evaluate("window.__shelbyPlayback?.command(" + JSONObject.quote(command) + "," + value + ");");

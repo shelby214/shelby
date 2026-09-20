@@ -17,7 +17,7 @@
   const internalPauseEvents = new WeakMap();
   const providerPauseEvents = new WeakMap();
   const state = {
-    media: null, wantsPlay: false, pausedByUser: false, nativeBackground: false, presentation: false,
+    seekIntent: null, media: null, wantsPlay: false, pausedByUser: false, nativeBackground: false, presentation: false,
     suspended: false, platformPaused: false, resumeAfterFocus: false, internalPause: 0,
     navigating: false, intentVideoId: '', intentSource: '', endedVideoId: '',
     lastUrl: location.href, lastSnapshot: null, pendingRestore: null, restoreFailure: null, restoreCheckpoint: null,
@@ -380,6 +380,23 @@
     return restore(saved);
   }
 
+  // Provider controls temporarily pause while scrubbing. Keep the pre-seek intent,
+  // but never override a subsequent explicit pause or a Chromium focus interruption.
+  function beginUserSeek(media) {
+    if (!media) return;
+    const previous = state.seekIntent;
+    state.seekIntent = { media, until: Date.now() + 5000,
+      resume: previous?.media === media && previous.until >= Date.now() ? previous.resume :
+        (!state.pausedByUser && !state.platformPaused && (!media.paused || state.wantsPlay)) };
+    state.restoreCheckpoint = null;
+    state.restoreFailure = null;
+    cancelRestore();
+  }
+
+  function seekingWithIntent(media) {
+    return state.seekIntent?.media === media && state.seekIntent.until >= Date.now();
+  }
+
   function seek(media, seconds) {
     if (!media || !media.seekable?.length || !Number.isFinite(Number(seconds))) return false;
     const desired = Math.max(0, Number(seconds));
@@ -387,7 +404,7 @@
     const target = Math.min(desired, end);
     for (let index = 0; index < media.seekable.length; index++) {
       if (target >= media.seekable.start(index) && target <= media.seekable.end(index)) {
-        try { media.currentTime = target; state.restoreCheckpoint = null; state.restoreFailure = null; send(true); return true; } catch (_) { return false; }
+        try { beginUserSeek(media); media.currentTime = target; state.restoreCheckpoint = null; state.restoreFailure = null; send(true); return true; } catch (_) { return false; }
       }
     }
     return false;
@@ -429,6 +446,7 @@
         break;
       case 'pause':
       case 'stop':
+        state.seekIntent = null;
         cancelRestore();
         state.pausedByUser = true; state.wantsPlay = false; state.platformPaused = false; state.resumeAfterFocus = false;
         if (state.restoreFailure) Object.assign(state.restoreFailure.saved, { playing: false, wantsPlay: false, pausedByUser: true });
@@ -437,6 +455,7 @@
       case 'seek': cancelRestore(); return seek(media, value);
       case 'seekBy': cancelRestore(); return seek(media, finite(media?.currentTime) + finite(value));
       case 'suspend':
+        state.seekIntent = null;
         if (!state.suspended) state.resumeAfterFocus = state.wantsPlay && !state.pausedByUser;
         state.suspended = true;
         pauseInternally(media);
@@ -562,11 +581,13 @@
       if (!internalPause && !state.internalPause && !state.suspended && !state.navigating && !media.ended) {
         if (!providerPause && !state.pausedByUser) {
           state.platformPaused = true;
-        } else if (providerPause && !inBackground()) {
+        } else if (providerPause && !inBackground() && !seekingWithIntent(media)) {
           state.pausedByUser = true; state.wantsPlay = false;
           state.intentVideoId = id || expected;
         }
       }
+    } else if (['seeked', 'canplay'].includes(event.type) && seekingWithIntent(media)) {
+      if (state.seekIntent.resume) playSafely(media);
     } else if (event.type === 'ended') {
       // Preserve queue intent, but never restart the ended track from a watchdog.
       state.endedVideoId = id || state.intentVideoId;
@@ -578,7 +599,86 @@
     send(false, false);
   }
 
-  const controller = { documentId, command, setBackground, setPresentation, restore, retryRestore, send, activeMedia, prepareNavigation };
+  function settingsPlayer() {
+    const music = document.querySelector('ytmusic-player');
+    return music?.playerApi || music?.player || document.getElementById('movie_player');
+  }
+  function audioDetails() {
+    const media = activeMedia(), player = settingsPlayer();
+    const read = name => { try { return player?.[name]?.(); } catch (_) { return null; } };
+    const stats = read('getStatsForNerds') || {};
+    const response = read('getPlayerResponse') || {};
+    const id = providerId(media);
+    const verified = Boolean(media && id && id === response.videoDetails?.videoId && !isAd(media));
+    // Stats identify the currently selected format. Available formats alone cannot
+    // tell us which audio stream is playing, and may belong to an earlier SPA track.
+    const statsId = String(stats.video_id_and_cpn || '').split(' / ')[0].trim();
+    const currentStats = verified && statsId === id;
+    const audioCodec = currentStats ? String(stats.codecs || '').split(' / ').at(-1) : '';
+    const formatId = audioCodec.match(/\((\d+)\)\s*$/)?.[1];
+    const formats = verified && Array.isArray(response.streamingData?.adaptiveFormats)
+      ? response.streamingData.adaptiveFormats.filter(f => /^audio\//.test(f.mimeType || '')) : [];
+    const matches = formats.filter(f => String(f.itag) === formatId);
+    const active = matches.length === 1 ? matches[0] : null;
+    const positive = value => Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : null;
+    const describe = format => ({
+      formatId: format.itag,
+      codec: format.mimeType?.match(/codecs="([^"]+)"/)?.[1] || null,
+      container: format.mimeType?.split(';')[0] || null,
+      averageBitrate: positive(format.averageBitrate), bitrate: positive(format.bitrate),
+      sampleRate: positive(format.audioSampleRate), channels: positive(format.audioChannels),
+      quality: { AUDIO_QUALITY_LOW: 'Low', AUDIO_QUALITY_MEDIUM: 'Normal', AUDIO_QUALITY_HIGH: 'High' }[format.audioQuality] || null
+    });
+    let bufferedSeconds = null;
+    try {
+      for (let i=0; i<media.buffered.length; i++) {
+        if (media.currentTime >= media.buffered.start(i) && media.currentTime <= media.buffered.end(i)) {
+          bufferedSeconds = Math.max(0, media.buffered.end(i) - media.currentTime); break;
+        }
+      }
+    } catch (_) {}
+    const config = verified ? response.playerConfig?.audioConfig || {} : {};
+    return {
+      title: verified ? response.videoDetails?.title || '' : '',
+      artist: verified ? response.videoDetails?.author || '' : '',
+      status: !media ? 'No active track' : isAd(media) ? 'Advertisement' : media.paused ? 'Paused' : media.readyState < 3 ? 'Buffering' : 'Playing',
+      source: active ? 'Matched to the active audio stream' : 'Detailed stream metadata unavailable',
+      active: active ? describe(active) : null,
+      codecDisplay: currentStats ? audioCodec.replace(/\s*\(\d+\)\s*$/, '') : null,
+      formats: formats.map(describe),
+      highQualityAvailable: formats.some(f => f.audioQuality === 'AUDIO_QUALITY_HIGH'),
+      speed: media?.playbackRate || 1,
+      muted: Boolean(media?.muted), volumePercent: media ? Math.round(media.volume * 100) : null,
+      bufferedSeconds,
+      networkEstimate: currentStats && typeof stats.bandwidth_kbps === 'string' ? stats.bandwidth_kbps.slice(0,64) : null,
+      normalization: currentStats && typeof stats.volume === 'string' ? stats.volume.slice(0,120) : null,
+      loudnessLkfs: Number.isFinite(config.trackAbsoluteLoudnessLkfs) ? config.trackAbsoluteLoudnessLkfs : null,
+      targetLkfs: Number.isFinite(config.loudnessTargetLkfs) ? config.loudnessTargetLkfs : null
+    };
+  }
+  function playbackOptions() {
+    const player = settingsPlayer();
+    let qualities = [], quality = 'auto';
+    try { qualities = player?.getAvailableQualityLevels?.() || []; quality = player?.getPlaybackQuality?.() || 'auto'; } catch (_) {}
+    return { speed: activeMedia()?.playbackRate || 1, qualities, quality, available: Boolean(activeMedia()) };
+  }
+  function setSpeed(value) {
+    const speed = Number(value), media = activeMedia();
+    if (!media || ![0.25,0.5,0.75,1,1.25,1.5,1.75,2].includes(speed)) return false;
+    try { settingsPlayer()?.setPlaybackRate?.(speed); media.playbackRate = speed; return true; } catch (_) { return false; }
+  }
+  function setQuality(value) {
+    const player = settingsPlayer();
+    if (!player || !playbackOptions().qualities.includes(value)) return false;
+    try {
+      // Quality changes can replace the stream and temporarily pause it like a seek.
+      beginUserSeek(activeMedia());
+      player.setPlaybackQualityRange?.(value);
+      player.setPlaybackQuality(value);
+      return true;
+    } catch (_) { return false; }
+  }
+  const controller = { audioDetails, playbackOptions, setSpeed, setQuality, documentId, command, setBackground, setPresentation, restore, retryRestore, send, activeMedia, prepareNavigation };
   window.__shelbyPlayback = controller;
   window.__ytCleanMediaMonitor = controller;
   window.__shelbyEnterBackground = () => setBackground(true);
@@ -601,6 +701,7 @@
   // Capture intent before YouTube's handlers. A deliberate pause must also work in PiP
   // and while a visibility transition is in flight.
   function userIntent(play) {
+    state.seekIntent = null;
     state.pausedByUser = !play;
     state.wantsPlay = play;
     state.platformPaused = false;
@@ -626,21 +727,21 @@
     const media = activeMedia();
     const target = event.target;
     if (target?.closest?.('[role="slider"],input[type="range"],.ytp-progress-bar-container,#progress-bar')) {
-      state.restoreCheckpoint = null;
+      beginUserSeek(media);
       return;
     }
     // Mini surface taps are expand gestures; its click handler runs after this document
     // capture listener. Do not misclassify the tap (or entry swipe's click) as pause.
     if (state.presentation && target === media) return;
     const label = (target?.closest?.('button,[role="button"]')?.getAttribute?.('aria-label') || '').toLowerCase();
-    if (!media || (!target?.closest?.('.ytp-play-button,#play-pause-button,.play-pause-button') && target !== media &&
-        !/^(?:play|pause)(?:$|\s*\()/.test(label))) return;
+    if (!media || (!target?.closest?.('.ytp-play-button,#play-pause-button,.play-pause-button') &&
+        !/^(?:play|pause)(?:$|\s)/.test(label))) return;
     const pause = label.includes('pause') || (!label.includes('play') && !media.paused);
     userIntent(!pause);
   }, true);
   document.addEventListener('keydown', event => {
     if (event.isTrusted && ['ArrowLeft', 'ArrowRight', 'j', 'J', 'l', 'L'].includes(event.key) &&
-        !event.target?.closest?.('input,textarea,[contenteditable="true"]')) state.restoreCheckpoint = null;
+        !event.target?.closest?.('input,textarea,[contenteditable="true"]')) beginUserSeek(activeMedia());
     if (!event.isTrusted || ![' ', 'k', 'K', 'MediaPlayPause'].includes(event.key) ||
         event.target?.closest?.('input,textarea,[contenteditable="true"]')) return;
     const media = activeMedia();
@@ -650,7 +751,9 @@
 
   let miniGesture = null;
   const userSeekGesture = event => {
-    if (event.isTrusted && event.target?.closest?.('[role="slider"],input[type="range"],.ytp-progress-bar-container,#progress-bar')) state.restoreCheckpoint = null;
+    if (!event.isTrusted) return;
+    const media = activeMedia();
+    if (event.target === media || event.target?.closest?.('[role="slider"],input[type="range"],.ytp-progress-bar-container,#progress-bar,.html5-video-player,#movie_player,.player-controls-background')) beginUserSeek(media);
   };
   document.addEventListener('pointerdown', userSeekGesture, { capture: true, passive: true });
   document.addEventListener('touchstart', userSeekGesture, { capture: true, passive: true });

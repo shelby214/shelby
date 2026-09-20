@@ -29,6 +29,7 @@ public final class PlaybackLifecycleTest extends InstrumentationTestCase {
     private static final String MUSIC_SNAPSHOT = "{\"url\":\"" + MUSIC_TRACK
             + "\",\"mediaUrl\":\"" + MUSIC_TRACK + "\",\"videoId\":\"abcdefghijk\","
             + "\"playing\":false,\"pausedByUser\":true,\"position\":42.5,\"duration\":180}";
+    private int previousTaskId;
     private Context app;
     private PlaybackSession session;
     private Activity currentActivity;
@@ -39,6 +40,7 @@ public final class PlaybackLifecycleTest extends InstrumentationTestCase {
         super.setUp();
         app = getInstrumentation().getTargetContext().getApplicationContext();
         preferences = app.getSharedPreferences("playback_session", Context.MODE_PRIVATE);
+        previousTaskId = preferences.getInt("task_id", -1);
         for (String key : new String[]{"selected", "music", "music_url", "youtube", "youtube_url"}) {
             previousPreferences.put(key, preferences.getString(key, null));
         }
@@ -63,6 +65,8 @@ public final class PlaybackLifecycleTest extends InstrumentationTestCase {
                 if (entry.getValue() == null) editor.remove(entry.getKey());
                 else editor.putString(entry.getKey(), entry.getValue());
             }
+            if (previousTaskId == -1) editor.remove("task_id");
+            else editor.putInt("task_id", previousTaskId);
             editor.commit();
         } finally {
             super.tearDown();
@@ -206,10 +210,49 @@ public final class PlaybackLifecycleTest extends InstrumentationTestCase {
         }
     }
 
+    public void testNewTaskDiscardsPlaybackButSameTaskRetainsIt() throws Exception {
+        launchActivity();
+        getInstrumentation().runOnMainSync(() -> {
+            int task = currentActivity.getTaskId();
+            PlaybackSession.prepareTask(app, task);
+            assertSame(session, PlaybackSession.obtain(app));
+            assertTrue(preferences.contains("music"));
+            PlaybackSession.prepareTask(app, task + 10000);
+            assertFalse(preferences.contains("music"));
+            assertFalse(preferences.contains("selected"));
+            assertNotSame(session, PlaybackSession.obtain(app));
+            PlaybackSession.discard(app);
+            assertTrue(preferences.getAll().isEmpty());
+        });
+    }
+
+    public void testFullscreenRequestsLandscapeAndRestoresOrientation() throws Exception {
+        launchActivity();
+        getInstrumentation().runOnMainSync(() -> {
+            MainActivity activity = (MainActivity) currentActivity;
+            int original = activity.getRequestedOrientation();
+            activity.onFullScreen(new android.widget.FrameLayout(activity), () -> {});
+            assertEquals(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE,
+                    activity.getRequestedOrientation());
+            activity.onExitFullScreen();
+            assertEquals(original, activity.getRequestedOrientation());
+            assertSame(session, field(activity, "session"));
+        });
+    }
+
     private void launchActivity() {
         Intent launch = new Intent(app, MainActivity.class)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
-        currentActivity = getInstrumentation().startActivitySync(launch);
+        // Seed a same-task restore fixture before MainActivity reads its task identity.
+        Application application = (Application) app;
+        Application.ActivityLifecycleCallbacks seed = new EmptyLifecycleCallbacks() {
+            @Override public void onActivityPreCreated(Activity activity, Bundle saved) {
+                preferences.edit().putInt("task_id", activity.getTaskId()).commit();
+            }
+        };
+        application.registerActivityLifecycleCallbacks(seed);
+        try { currentActivity = getInstrumentation().startActivitySync(launch); }
+        finally { application.unregisterActivityLifecycleCallbacks(seed); }
         getInstrumentation().waitForIdleSync();
     }
 

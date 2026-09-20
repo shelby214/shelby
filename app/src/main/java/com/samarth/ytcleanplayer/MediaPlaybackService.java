@@ -543,6 +543,7 @@ public class MediaPlaybackService extends Service {
     @Override
     public void onTaskRemoved(Intent rootIntent) {
         stopPlayback(true);
+        PlaybackSession.discard(this);
         super.onTaskRemoved(rootIntent);
     }
 

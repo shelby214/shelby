@@ -625,3 +625,125 @@ test('reinjecting controller does not install duplicate periodic work', () => {
   env.advance(2000);
   assert.equal(env.snapshots.length, before + 1);
 });
+
+test('10 and 20 second skips resume after a provider seek pause', () => {
+  for (const seconds of [10, 20]) {
+    const env = fixture(); env.start();
+    env.controller.command('seekBy', seconds);
+    env.media.pause(); env.advance(30);
+    assert.equal(env.media.currentTime, seconds);
+    assert.equal(env.media.paused, false);
+    assert.equal(env.last().pausedByUser, false);
+  }
+});
+
+test('video tap is not a pause command and double-tap seek retains playback', () => {
+  const env = fixture(); env.start();
+  env.document.dispatch('pointerdown', { target: env.media });
+  env.document.dispatch('click', { target: env.media });
+  env.media.pause(); env.media.currentTime = 20; env.advance(30);
+  assert.deepEqual(env.userIntents, []);
+  assert.equal(env.media.paused, false);
+});
+
+test('slider seek resumes playback but explicit pause and focus loss win', () => {
+  for (const interruption of ['none', 'pause', 'focus']) {
+    const env = fixture(); env.start();
+    const slider = { closest: selector => selector.includes('slider') ? slider : null };
+    env.document.dispatch('pointerdown', { target: slider });
+    env.media.pause(); env.advance(0);
+    env.media.currentTime = 60;
+    if (interruption === 'pause') env.controller.command('pause');
+    if (interruption === 'focus') { env.media.paused = true; env.media.emit('pause'); }
+    env.advance(30);
+    assert.equal(env.media.paused, interruption !== 'none', interruption);
+  }
+});
+
+test('seeking a deliberately paused video stays paused and Play video resumes it', () => {
+  const env = fixture(); env.start();
+  env.controller.command('pause'); env.advance(2000);
+  env.controller.command('seekBy', 20); env.advance(30);
+  assert.equal(env.media.paused, true);
+  const button = { closest: selector => selector === 'button,[role="button"]' ? button : null,
+    getAttribute: () => 'Play video' };
+  env.document.dispatch('click', { target: button });
+  env.media.play(); env.advance(30);
+  assert.equal(env.media.paused, false);
+  assert.deepEqual(env.userIntents, [true]);
+});
+
+test('mobile controls overlay double-tap seek clears a paused restore checkpoint', () => {
+  const env = fixture();
+  env.controller.restore(env.saved({playing:false, pausedByUser:true})); env.advance(30);
+  const overlay = { closest: selector => selector.includes('.player-controls-background') ? overlay : null };
+  env.document.dispatch('pointerdown', {target:overlay});
+  env.media.currentTime = 103; env.advance(30);
+  assert.equal(env.media.currentTime, 103);
+  assert.equal(env.media.paused, true);
+  assert.equal(env.last().restoreCheckpoint, null);
+  env.controller.command('play'); env.advance(30);
+  assert.equal(env.media.paused, false);
+  assert.equal(env.media.currentTime, 103);
+});
+
+test('settings expose available qualities and apply speed and resolution without losing playback intent', () => {
+  const env = fixture(); env.start();
+  const chosen = [];
+  env.player.getAvailableQualityLevels = () => ['hd720', 'medium', 'auto'];
+  env.player.getPlaybackQuality = () => 'medium';
+  env.player.setPlaybackQualityRange = q => chosen.push(['range', q]);
+  env.player.setPlaybackQuality = q => { chosen.push(['quality', q]); env.media.pause(); };
+  env.player.setPlaybackRate = speed => chosen.push(['speed', speed]);
+  assert.equal(env.controller.playbackOptions().quality, 'medium');
+  assert.equal(env.controller.setSpeed(1.5), true);
+  assert.equal(env.media.playbackRate, 1.5);
+  assert.equal(env.controller.setSpeed(99), false);
+  assert.equal(env.controller.setQuality('hd2160'), false);
+  assert.equal(env.controller.setQuality('hd720'), true);
+  env.advance(0); env.media.emit('canplay'); env.advance(0);
+  assert.equal(env.media.paused, false);
+  assert.deepEqual(chosen, [['speed',1.5],['range','hd720'],['quality','hd720']]);
+  env.controller.command('pause'); env.advance(0);
+  env.controller.setQuality('auto'); env.media.emit('canplay'); env.advance(0);
+  assert.equal(env.media.paused, true);
+});
+
+test('audio details match the active format rather than the largest available bitrate', () => {
+  const env = fixture(); env.start();
+  env.media.playbackRate = 1;
+  env.media.buffered = {length:1,start:()=>0,end:()=>30};
+  env.player.getPlayerResponse = () => ({videoDetails:{videoId:VIDEO,title:'Track',author:'Artist'},
+    streamingData:{adaptiveFormats:[
+      {itag:140,mimeType:'audio/mp4; codecs="mp4a.40.2"',averageBitrate:129000,bitrate:131000,audioSampleRate:'44100',audioChannels:2,audioQuality:'AUDIO_QUALITY_MEDIUM'},
+      {itag:251,mimeType:'audio/webm; codecs="opus"',averageBitrate:141083,bitrate:156569,audioSampleRate:'48000',audioChannels:2,audioQuality:'AUDIO_QUALITY_MEDIUM'},
+      {itag:774,mimeType:'audio/webm; codecs="opus"',averageBitrate:256000,audioQuality:'AUDIO_QUALITY_HIGH'}]}});
+  env.player.getStatsForNerds = () => ({video_id_and_cpn:VIDEO+' / private-session-id',codecs:'avc1 (137) / opus (251)',bandwidth_kbps:'8412 Kbps'});
+  const details = env.controller.audioDetails();
+  assert.equal(details.active.averageBitrate,141083);
+  assert.equal(details.active.sampleRate,48000);
+  assert.equal(details.active.channels,2);
+  assert.equal(details.highQualityAvailable,true);
+  assert.equal(details.bufferedSeconds,30);
+  assert.equal(details.networkEstimate,'8412 Kbps');
+  assert.equal(JSON.stringify(details).includes('private-session-id'),false);
+  env.player.getStatsForNerds = () => ({video_id_and_cpn:OTHER+' / stale',codecs:'0 / opus (251)'});
+  assert.equal(env.controller.audioDetails().active,null,'stale stats cannot identify the active stream');
+});
+
+test('audio details reject stale metadata, ads, ambiguous formats and unavailable methods', () => {
+  const env = fixture(); env.start();
+  assert.equal(env.controller.audioDetails().active,null);
+  const format = {itag:251,mimeType:'audio/webm; codecs="opus"',averageBitrate:150000};
+  env.player.getStatsForNerds = () => ({video_id_and_cpn:VIDEO+' / id',codecs:'0 / opus (251)'});
+  let response = {videoDetails:{videoId:OTHER},streamingData:{adaptiveFormats:[format]}};
+  env.player.getPlayerResponse = () => response;
+  assert.equal(env.controller.audioDetails().formats.length,0);
+  response.videoDetails.videoId=VIDEO;
+  response.streamingData.adaptiveFormats.push({...format,audioTrack:{id:'other-language'}});
+  assert.equal(env.controller.audioDetails().active,null,'duplicate format IDs require a verified track match');
+  env.ad=true;
+  assert.equal(env.controller.audioDetails().formats.length,0);
+  env.player.getStatsForNerds = () => {throw new Error('unsupported');};
+  assert.doesNotThrow(()=>env.controller.audioDetails());
+});

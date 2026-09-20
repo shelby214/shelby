@@ -53,3 +53,21 @@ The user requested a separate check of the floating section switch, draggable mi
 - Testing caught two regressions: the drag listener consumed ordinary video/Undo taps, and dismissal left an active paused media session. The touch listener now cancels a click only after a drag crosses the system touch threshold. Native STOP now removes the service and media controls, and rejects late paused updates after dismissal.
 
 Final device retest: a video tap expanded the mini player while playback continued past 15 seconds. A drag moved it to `(21,871)` with playback continuing beyond 23 seconds. Dropping on the red target returned to YouTube Home; `MediaPlaybackService`, the Shelby media session and notification ID 41 were all absent afterwards. No fatal exception appeared in the checked device log. All three requested side-chat behaviors passed after these two regression fixes.
+
+## September 20, 2026 — playback controls and fresh tasks
+
+Build 33 / 2.0.1-preview:
+
+- JavaScript regression suite: 77 passing tests, including 10/20-second seeks, slider and mobile overlay seek intent, pause/resume, quality changes, speed validation.
+- Pixel 9: eight Android instrumentation tests passed, including same-task retention/new-task reset and fullscreen orientation restoration.
+- Live YouTube on Pixel 9: 10/20-second native skips continued playback; paused seek stayed paused and explicit Play resumed. Mobile Play video control and slider scrubbing also worked.
+- Fullscreen entered landscape and Back restored portrait while playback continued. The temporary Fill option was subsequently removed at the user’s request; original aspect-ratio sizing is retained.
+- The live provider accepted 720p (decoded video changed to 1280×720) and 1.5× speed while playback continued. Fullscreen settings were visually inspected on the phone.
+- Swiping the playing app out of Recents cleared playback_session preferences. The next launch opened Music with no restored track or playback position.
+- Preview/debug APK builds and Preview lint passed. These checks cover this Pixel and the tested videos; quality options depend on the streams YouTube exposes for each video.
+
+## September 20, 2026 — audio details
+
+Build 34 / 2.0.2-preview: 79 JavaScript tests passed; Preview/debug APK builds and Preview lint passed. Regression cases cover active format matching, stale statistics and metadata, ambiguous audio-format IDs, advertisements, unavailable methods, and omission of playback-session identifiers.
+
+Installed on the connected Pixel 9. The live Music track reported active Opus format 251, 141.083 kbps average / 156.569 kbps advertised bitrate, 48 kHz, stereo. The native panel matched those values, refreshed buffering while playing, and preserved its scroll position during refresh. Both the settings entry and the detailed panel were visually inspected. No High-quality format was exposed for this test track/account; no audio-quality upgrade is claimed.
